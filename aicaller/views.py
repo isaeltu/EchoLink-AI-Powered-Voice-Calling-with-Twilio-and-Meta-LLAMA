@@ -33,7 +33,7 @@ speech_language = "es-MX"  # recognition language for the customer's speech (Gat
 # neural voices sound like an actual person -- this is the output voice, a
 # separate concern from speech_language above (which is about recognizing
 # what the *customer* says, not how the agent sounds).
-tts_voice = "Polly.Lupe-Neural"
+tts_voice = "Polly.Lupe-Generative"
 tts_language = "es-US"
 
 twilio_account_sid = settings.TWILIO_ACCOUNT_SID
