@@ -1,38 +1,244 @@
+import json
+import re
+
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse
 from django.shortcuts import render
 from django.views import View
-from .models import Lead, Appointment, SalesAgent, VoiceCall, VoiceMessage
-from .serializers import UserSerializer, LeadSerializer
-from django.views.decorators.csrf import csrf_exempt
+from .models import Lead, VoiceCall, VoiceMessage
 from django.conf import settings
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
 from huggingface_hub import InferenceClient
-import webbrowser
-from urllib.parse import urlencode
+import requests
 from django.utils import timezone
 
-# using Facebook Meta-LLMA large language model for call reply.
-model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
-# model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-client = InferenceClient(model=model_name, token=settings.HUGGINGFACE_TOKEN)
+# Hosted Hugging Face Inference Providers (not run locally -- no GPU/torch
+# needed on this server, the request just goes out over HTTPS).
+# provider="auto" routes to whichever backend is fastest for this model right
+# now (Groq, Cerebras, etc. are all faster than HF's own shared GPU pool),
+# which matters more for call latency than anything in our own code does.
+client = InferenceClient(api_key=settings.HUGGINGFACE_TOKEN, provider="auto")
 
+# How long Twilio waits for the customer to start speaking before giving up.
 speaker_timeout = 5
+# How long Twilio waits, after speech activity ends, before finalizing the
+# transcript -- "auto" uses Twilio's own adaptive end-of-speech detection
+# instead of a fixed multi-second silence wait, which is what made the
+# original Gather feel slow to respond.
+speech_timeout = "auto"
+speech_language = "es-MX"
+
 twilio_account_sid = settings.TWILIO_ACCOUNT_SID
 twilio_auth_token = settings.TWILIO_AUTH_TOKEN
+
+# Asking this small open model to embed a tagged JSON block inside its own
+# conversational reply was unreliable -- it sometimes fired before the
+# customer had actually confirmed, and once skipped the <order> tags
+# entirely and nearly read raw JSON out loud. Order extraction is therefore
+# a separate, single-purpose LLM call (see extract_order_json), triggered
+# only by a deterministic check in code: the assistant's last turn must have
+# asked for confirmation, AND the customer's reply must contain a real "yes".
+CONFIRMATION_WORDS = (
+    "si", "sí", "confirmo", "correcto", "correcta", "asi es", "así es",
+    "exacto", "afirmativo", "dale", "vale", "esta bien", "está bien", "ok",
+)
+CONFIRMATION_PROMPT_WORDS = ("confirm", "correcto", "esta bien", "está bien")
+
+
+def customer_confirmed(speech: str) -> bool:
+    normalized = speech.lower().strip()
+    return any(word in normalized for word in CONFIRMATION_WORDS)
+
+
+def last_assistant_asked_to_confirm(call) -> bool:
+    last_assistant_message = (
+        VoiceMessage.objects.filter(voice_chat=call, role="assistant").order_by("-timestamp").first()
+    )
+    if not last_assistant_message:
+        return False
+    normalized = last_assistant_message.content.lower()
+    return any(word in normalized for word in CONFIRMATION_PROMPT_WORDS)
+
+_menu_cache = {"text": "", "fetched_at": None}
+MENU_CACHE_SECONDS = 300
+
+
+def fetch_menu_text() -> str:
+    """Fetch the live menu from RestoPOS via rpc/voice_get_menu, cached for a
+    few minutes so every conversational turn doesn't refetch it."""
+    now = timezone.now()
+    cached_at = _menu_cache["fetched_at"]
+    if cached_at and (now - cached_at).total_seconds() < MENU_CACHE_SECONDS:
+        return _menu_cache["text"]
+
+    if not (settings.SUPABASE_URL and settings.SUPABASE_ANON_KEY and settings.ORDER_WEBHOOK_API_KEY):
+        return ""
+
+    try:
+        resp = requests.post(
+            f"{settings.SUPABASE_URL}/rest/v1/rpc/voice_get_menu",
+            json={"p_api_key": settings.ORDER_WEBHOOK_API_KEY},
+            headers={
+                "apikey": settings.SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {settings.SUPABASE_ANON_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        menu = resp.json() or {}
+    except Exception as e:
+        print(f"Error fetching menu: {e}")
+        return _menu_cache["text"]
+
+    products = menu.get("products") or []
+    if not products:
+        return ""
+
+    categories = {c["id"]: c["name"] for c in menu.get("categories") or []}
+    lines_by_category = {}
+    for product in products:
+        category_name = categories.get(product.get("categoryId"), "Otros")
+        line = f"- {product['name']}: {product['price']}"
+        if product.get("description"):
+            line += f" ({product['description']})"
+        lines_by_category.setdefault(category_name, []).append(line)
+
+    sections = [
+        f"{name}:\n" + "\n".join(lines) for name, lines in lines_by_category.items()
+    ]
+    text = (
+        "MENU ACTUAL (los unicos productos disponibles; usa exactamente estos "
+        "nombres y precios, no inventes otros):\n\n" + "\n\n".join(sections)
+    )
+    _menu_cache["text"] = text
+    _menu_cache["fetched_at"] = now
+    return text
+
+
+def build_system_prompt(extra_instructions: str = "") -> str:
+    restaurant_name = settings.RESTAURANT_NAME or "el restaurante"
+    menu_text = fetch_menu_text()
+    return f"""Eres el asistente de voz de {restaurant_name}. Tomas pedidos de comida por telefono en espanol, de forma natural y amable.
+
+Reglas:
+- Solo ofrece productos que aparezcan textualmente en MENU ACTUAL. Si el cliente pide algo que no esta, dile que no esta disponible y sugiere 2-3 alternativas reales del menu.
+- Confirma cada producto, cantidad y notas especiales que mencione el cliente.
+- Pregunta si es para recoger (pickup) o entrega (delivery); si es entrega, pide la direccion completa.
+- Pide el nombre del cliente y un numero de telefono de contacto.
+- Antes de cerrar, repite el pedido completo y pregunta explicitamente "¿confirmas tu pedido?" o similar.
+- Mantén tus respuestas a una o dos frases, como un agente de telefono eficiente. No repitas el menu completo a menos que el cliente lo pida.
+{extra_instructions}
+
+{menu_text}
+"""
+
+
+def extract_order_json(call):
+    """Single-purpose extraction call: given the conversation so far, return
+    ONLY a JSON object with the confirmed order, or None.
+
+    Kept separate from generate_reply() because asking this model to embed a
+    tagged JSON block inside its own conversational answer was unreliable --
+    it fired before the customer had actually said yes, and once skipped the
+    <order> tags entirely. A dedicated extraction-only call, triggered by a
+    deterministic confirmation check in code (not by the model's judgment),
+    is far more reliable.
+    """
+    history_lines = [
+        f"{'Cliente' if m.role != 'assistant' else 'Asistente'}: {m.content}"
+        for m in VoiceMessage.objects.filter(voice_chat=call).order_by("timestamp")
+    ]
+    extraction_prompt = (
+        "Basandote en esta conversacion entre el asistente de voz de un restaurante "
+        "y un cliente, extrae el pedido final ya confirmado. Responde UNICAMENTE con "
+        "un objeto JSON valido, sin texto adicional y sin markdown, con exactamente "
+        "esta forma:\n"
+        '{"items": [{"name": "...", "quantity": 1, "notes": ""}], "customer_name": "...", '
+        '"customer_phone": "...", "delivery_type": "pickup o delivery", '
+        '"delivery_address": "...", "special_instructions": "..."}\n\n'
+        "Conversacion:\n" + "\n".join(history_lines)
+    )
+    try:
+        res = client.chat.completions.create(
+            model=settings.HF_MODEL_NAME,
+            messages=[{"role": "user", "content": extraction_prompt}],
+            max_tokens=300,
+        )
+        text = res.choices[0].message.content.strip()
+        text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
+        json.loads(text)  # validate before handing it back
+        return text
+    except Exception as e:
+        print(f"Error extracting order JSON: {e}")
+        return None
+
+
+def submit_order(call_sid, customer_phone, order_json_text):
+    """POST the confirmed order to the same RestoPOS webhook the Gemini-based
+    voice agent uses (voice-order-webhook -> rpc/voice_create_order)."""
+    try:
+        order_data = json.loads(order_json_text)
+    except (ValueError, TypeError) as e:
+        print(f"Could not parse order JSON for call {call_sid}: {e}")
+        return None
+
+    payload = {
+        "event": "order.created",
+        "restaurant_id": settings.RESTAURANT_ID,
+        "call_sid": call_sid,
+        "customer": {
+            "name": order_data.get("customer_name"),
+            "phone": order_data.get("customer_phone") or customer_phone,
+        },
+        "order": {
+            "items": order_data.get("items", []),
+            "delivery_type": order_data.get("delivery_type"),
+            "delivery_address": order_data.get("delivery_address"),
+            "special_instructions": order_data.get("special_instructions"),
+        },
+        "created_at": timezone.now().isoformat(),
+    }
+    headers = {"Content-Type": "application/json"}
+    if settings.ORDER_WEBHOOK_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.ORDER_WEBHOOK_API_KEY}"
+
+    try:
+        resp = requests.post(settings.ORDER_WEBHOOK_URL, json=payload, headers=headers, timeout=10)
+        body = resp.json() if resp.content else {}
+        print(f"Order submission result for call {call_sid}: {body}")
+        return body.get("order_id")
+    except Exception as e:
+        print(f"Error submitting order for call {call_sid}: {e}")
+        return None
+
+
+def generate_reply(call, max_tokens=180) -> str:
+    """Run the LLM over the call's message history and return the speakable reply."""
+    messages = [{"role": "system", "content": build_system_prompt()}]
+    for m in VoiceMessage.objects.filter(voice_chat=call).order_by("timestamp"):
+        role = "assistant" if m.role == "assistant" else "user"
+        messages.append({"role": role, "content": m.content})
+
+    try:
+        res = client.chat.completions.create(
+            model=settings.HF_MODEL_NAME, messages=messages, max_tokens=max_tokens
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Error calling HF inference: {e}")
+        return "Disculpa, tuve un problema tecnico. Puedes repetir, por favor?"
+
 
 @method_decorator(csrf_exempt, name='dispatch')
 class InboundCalls(View):
     def __init__(self):
-        self.welcome_message = "Welcome to Weaver Eco Home, please tell us why you\'re calling?"
-        self.fallback_message = "We didn't receive any input. Thank you for Calling Weaver Eco Home. Have a good day and Goodbye!"
-        self.closing_message = "Thank you for calling today! Enjoy your rest of the day."
-        
+        self.fallback_message = "No recibimos respuesta. Gracias por llamar. Hasta luego."
+        self.closing_message = "Gracias por tu pedido. Que tengas un buen dia."
+
     def get(self, request):
-        phone_number = request.GET.get('From')
-        leads = Lead.objects.filter(phone_number=phone_number)
         return render(request, "admin/aicaller/inbounds.html", {
             "data": request.GET,
             "callId": request.GET.get("CallSid"),
@@ -41,173 +247,133 @@ class InboundCalls(View):
         })
 
     def post(self, request):
-        prompt = {
-            "role": "system", 
-            "content": f"""You are an AI voice call assistant at Weaver Eco Home for the role of
-                customer support. Weaver Eco Home is an HVAC company that sells heat pump, 
-                air conditioner, and so on. Please access the website for this company hosted at 
-                https://www.weaverecohome.ca/ for more information. Please act the way to provide
-                customer support asking them about problems. Only reply in two sentences.\n
-            """
-        }
         CallSid = request.POST.get("CallSid")
+        customer_phone = request.POST.get("From")
         call = VoiceCall.objects.filter(call_id=CallSid).first()
         if not call:
             call = VoiceCall(
-                call_id = CallSid,
-                ai_caller = "Beaver", 
-                start_time = timezone.now(), 
-                call_type = "inbound"
+                call_id=CallSid, ai_caller="EchoLink", start_time=timezone.now(), call_type="inbound"
             )
             call.save()
-            webbrowser.open_new(f"{settings.BASE_URL}/inbounds/?"+ urlencode(request.POST))
-        
-        response = VoiceResponse()
-        if request.POST.get('SpeechResult', ""):
-            speech = request.POST['SpeechResult']
-            message = VoiceMessage.objects.create(
-                voice_chat=call, role="user", content=speech, call_id=CallSid
-            )
-            messages = VoiceMessage.objects.filter(voice_chat = call)
-            all_messages = [{"role": message.role, "content": message.content} for message in messages]
-            reply = ''
-            res = client.chat_completion(messages=all_messages, max_tokens=1024)
-            reply = res.choices[0].message.content
-            message = VoiceMessage.objects.create(
-                voice_chat=call, role="assistant", content=reply, call_id=CallSid
-            )
-            gather = Gather(
-                input='speech', 
-                action=f'{settings.BASE_URL}/inbounds/', 
-                timeout=speaker_timeout
-            )
-            response.append(gather)
-            gather.say(reply)
-            response.say(self.fallback_message)            
-            return HttpResponse(str(response), content_type='text/xml')
-        
-        gather = Gather(
-            input='speech', 
-            action=f'{settings.BASE_URL}/inbounds/', 
-            timeout=speaker_timeout,
-        )
-        gather.say(self.welcome_message)
-        response.append(gather)
-        response.say(self.fallback_message)
-        return HttpResponse(str(response), content_type='text/xml')
 
+        response = VoiceResponse()
+        speech = request.POST.get('SpeechResult', "")
+
+        if not speech:
+            restaurant_name = settings.RESTAURANT_NAME or "nuestro restaurante"
+            greeting = f"Hola, bienvenido a {restaurant_name}. Que le gustaria ordenar?"
+            gather = Gather(
+                input='speech', action=f'{settings.BASE_URL}/inbounds/',
+                timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
+            )
+            gather.say(greeting, language=speech_language)
+            response.append(gather)
+            response.say(self.fallback_message, language=speech_language)
+            return HttpResponse(str(response), content_type='text/xml')
+
+        should_extract_order = customer_confirmed(speech) and last_assistant_asked_to_confirm(call)
+
+        VoiceMessage.objects.create(voice_chat=call, role="user", content=speech, call_id=CallSid)
+
+        if should_extract_order:
+            order_json = extract_order_json(call)
+            if order_json:
+                submit_order(CallSid, customer_phone, order_json)
+                VoiceMessage.objects.create(
+                    voice_chat=call, role="assistant", content=self.closing_message, call_id=CallSid
+                )
+                response.say(self.closing_message, language=speech_language)
+                response.hangup()
+                return HttpResponse(str(response), content_type='text/xml')
+            print(f"Order confirmation detected for call {CallSid} but extraction failed; continuing conversation.")
+
+        speakable_reply = generate_reply(call)
+        VoiceMessage.objects.create(voice_chat=call, role="assistant", content=speakable_reply, call_id=CallSid)
+
+        gather = Gather(
+            input='speech', action=f'{settings.BASE_URL}/inbounds/',
+            timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
+        )
+        gather.say(speakable_reply, language=speech_language)
+        response.append(gather)
+        response.say(self.fallback_message, language=speech_language)
+        return HttpResponse(str(response), content_type='text/xml')
 
 
 @method_decorator(csrf_exempt, name='dispatch')
 class OutboundsCalls(View):
     def __init__(self):
-        self.fallback_message = "We didn't receive any input. Thank you for Calling Weaver Eco Home. Have a good day and Goodbye!"
-        self.closing_message = "Thank you for calling today! Enjoy your rest of the day."
+        self.fallback_message = "No recibimos respuesta. Gracias por su tiempo. Hasta luego."
+        self.closing_message = "Gracias por su pedido. Que tenga un buen dia."
 
     def get(self, request, id=None):
         call_sid = None
+        lead = Lead.objects.get(pk=id)
         if id is not None:
-            lead = Lead.objects.get(pk=id)
-            client = Client(twilio_account_sid, twilio_auth_token)
-            call = client.calls.create(
+            client_rest = Client(twilio_account_sid, twilio_auth_token)
+            call = client_rest.calls.create(
                 from_=settings.TWILIO_PHONE_NUMBER,
                 to=lead.phone_number,
                 url=f'{settings.BASE_URL}/outbounds/{id}',
                 method="POST",
             )
             call_sid = call.sid
-            print(call_sid)
         return render(request, "admin/aicaller/outbounds.html", {
-            "lead": lead, 
-            "callId": call_sid, 
-            "twilio_account_sid": twilio_account_sid, 
+            "lead": lead,
+            "callId": call_sid,
+            "twilio_account_sid": twilio_account_sid,
             "twilio_auth_token": twilio_auth_token
         })
 
-    #prompt = Please ask about the size of their house, the type of gas they use, and the age of their furnace.
     def post(self, request, id=None):
         lead = Lead.objects.get(pk=id)
-        system = {
-            "role":"system",
-            "content": f"""You are an AI voice call assistant at Weaver Eco Home, 
-            making outbound calls for customer support. Weaver Eco Home is an HVAC company 
-            that sells heat pumps, air conditioners, and more. You are calling {lead.first_name}, 
-            a potential customer who inquired about heat pump.  Push the client to book an appointment for a 
-            consultation based on available slots. Be conversational and cheerful. Keep responses short and up to two maximum sentences.\n"""
-        }
-        prompt = {
-            "role": "assistant",
-            "content": f"""
-                Hi! Am I speaking to {lead.first_name}? 
-            """
-        }
         CallSid = request.POST.get("CallSid")
         call = VoiceCall.objects.filter(call_id=CallSid).first()
         if not call:
-            chat = VoiceCall(
-                lead = lead,
-                call_id=request.POST.get("CallSid"),
-                ai_caller="Beaver", 
-                start_time=timezone.now(), 
-                call_type='outbound'
+            call = VoiceCall(
+                lead=lead, call_id=CallSid, ai_caller="EchoLink",
+                start_time=timezone.now(), call_type='outbound',
             )
-            chat.save()
+            call.save()
 
         response = VoiceResponse()
-        if request.POST.get('SpeechResult', ""):
-            speech = request.POST['SpeechResult']
-            message = VoiceMessage.objects.create(
-                voice_chat=call, role="user", content=speech, call_id=CallSid
-            )
-            messages = VoiceMessage.objects.filter(voice_chat = call)
-            all_messages = [{"role": message.role, "content": message.content} for message in messages]
-            reply = ''
-            res = client.chat_completion(messages=all_messages, max_tokens=1024)
-            reply = res.choices[0].message.content
-            message = VoiceMessage.objects.create(
-                voice_chat=call, role="assistant", content=reply, call_id=CallSid
-            )
+        speech = request.POST.get('SpeechResult', "")
+
+        if not speech:
+            greeting = f"Hola, le habla {settings.RESTAURANT_NAME or 'el restaurante'}. Le gustaria hacer un pedido?"
             gather = Gather(
-                input='speech', 
-                action=f'{settings.BASE_URL}/outbounds/{id}', 
-                timeout=speaker_timeout
+                input='speech', action=f'{settings.BASE_URL}/outbounds/{id}',
+                timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
             )
+            gather.say(greeting, language=speech_language)
             response.append(gather)
-            gather.say(reply)
-            response.say(self.fallback_message)
-            self.intent_recognition(context= all_messages)
+            response.say(self.fallback_message, language=speech_language)
             return HttpResponse(str(response), content_type='text/xml')
-            
+
+        should_extract_order = customer_confirmed(speech) and last_assistant_asked_to_confirm(call)
+
+        VoiceMessage.objects.create(voice_chat=call, role="user", content=speech, call_id=CallSid)
+
+        if should_extract_order:
+            order_json = extract_order_json(call)
+            if order_json:
+                submit_order(CallSid, lead.phone_number, order_json)
+                VoiceMessage.objects.create(
+                    voice_chat=call, role="assistant", content=self.closing_message, call_id=CallSid
+                )
+                response.say(self.closing_message, language=speech_language)
+                response.hangup()
+                return HttpResponse(str(response), content_type='text/xml')
+            print(f"Order confirmation detected for call {CallSid} but extraction failed; continuing conversation.")
+
+        speakable_reply = generate_reply(call)
+        VoiceMessage.objects.create(voice_chat=call, role="assistant", content=speakable_reply, call_id=CallSid)
+
         gather = Gather(
-            input='speech', 
-            action=f'{settings.BASE_URL}/outbounds/{id}', 
-            timeout=speaker_timeout
+            input='speech', action=f'{settings.BASE_URL}/outbounds/{id}',
+            timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
         )
+        gather.say(speakable_reply, language=speech_language)
         response.append(gather)
-        gather.say(prompt['content'])
-        response.say(self.fallback_message)
+        response.say(self.fallback_message, language=speech_language)
         return HttpResponse(str(response), content_type='text/xml')
-
-    def intent_recognition(self, context):
-        current_date = timezone.now()
-
-        prompt = f"""
-            Analyze the entire conversation between the assistant and the
-            user to identify any booking intent. 
-            Determine the appointment time relative to the current date which is {current_date}.
-            Provide the results in the following only JSON formatted string, nothing else:
-
-            "intent": "booking",
-            "appointment_time": "YYYY-MM-DDTHH:MM:SSZ"
-
-            Make sure the `appointment_time` is accurate and based on the user's intent and context from the conversation.
-            context = {context}
-            """
-        
-        reply = ''
-        response = client.chat_completion(
-            messages=[{"role": "user", "content": prompt}], 
-            max_tokens=1024
-        )
-        reply = response.choices[0].message.content
-        print((reply))

@@ -2,22 +2,45 @@ from pathlib import Path
 import os
 import sys
 
+import dj_database_url
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(os.path.join(BASE_DIR, 'aicaller'))
 
-SECRET_KEY = "django-insecure-#n+(li_)zj2l&6fekaqkr0fn@2-(_tc8@&cuz0^b*etkw0w6ps"
-DEBUG = True
+load_dotenv(BASE_DIR / ".env")
 
-HUGGINGFACE_TOKEN = "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"
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-#n+(li_)zj2l&6fekaqkr0fn@2-(_tc8@&cuz0^b*etkw0w6ps")
+DEBUG = os.getenv("DJANGO_DEBUG", "false").lower() == "true"
 
-NGROK_URL = '80c6-2607-fea8-34a1-500-18b8-1ad6-fe4e-d342.ngrok-free.app'
-BASE_URL = f"https://{NGROK_URL}"
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
+HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 
-TWILIO_ACCOUNT_SID = "ACb31e3c6d4f6a94a7880855622b0db541"
-TWILIO_AUTH_TOKEN = "78dcc325163c90519badfdd1c545ce00"
-TWILIO_PHONE_NUMBER = "+19707103706"
+# Local dev: your ngrok URL. Production (Railway): set BASE_URL to the
+# deployed https URL, e.g. https://your-app.up.railway.app
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
-ALLOWED_HOSTS = [NGROK_URL, '127.0.0.1', 'localhost']
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+
+# RestoPOS Supabase project, used to fetch the live menu (rpc/voice_get_menu)
+# and submit confirmed orders (rpc/voice_create_order) -- same project and
+# api_key pattern as the ai-calling-agent (Gemini Live) voice agent.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+RESTAURANT_ID = os.getenv("RESTAURANT_ID", "")
+RESTAURANT_NAME = os.getenv("RESTAURANT_NAME", "")
+ORDER_WEBHOOK_API_KEY = os.getenv("ORDER_WEBHOOK_API_KEY", "")
+ORDER_WEBHOOK_URL = os.getenv(
+    "ORDER_WEBHOOK_URL",
+    "https://lxurfpnlvmrvarwbzygl.supabase.co/functions/v1/voice-order-webhook",
+)
+
+_allowed_hosts = os.getenv("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
+ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts.split(",") if h.strip()]
+# Railway's domain isn't known until deploy time; trust it automatically.
+ALLOWED_HOSTS.append(".up.railway.app")
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -26,7 +49,6 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "channels",
     "aicaller.apps.AicallerConfig",
 ]
 
@@ -60,29 +82,17 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "aicaller.wsgi.application"
 
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels.layers.InMemoryChannelLayer',
-    },
-}
-
-# CHANNEL_LAYERS = {
-#     'default': {
-#         'BACKEND': 'channels_redis.core.RedisChannelLayer',
-#         'CONFIG': {
-#             'hosts': [('127.0.0.1', 6379)],
-#         },
-#     },
-# }
-
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
+    # Railway provides DATABASE_URL automatically once a Postgres plugin is
+    # attached; without it (local dev) this falls back to the SQLite file.
+    # SQLite alone is not durable on Railway -- its filesystem is ephemeral
+    # across redeploys, so leads/call history would vanish on every deploy.
+    "default": dj_database_url.config(
+        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
+    )
 }
 
 
