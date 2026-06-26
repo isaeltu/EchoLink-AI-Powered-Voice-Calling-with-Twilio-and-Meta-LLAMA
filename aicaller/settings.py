@@ -14,7 +14,7 @@ SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-#n+(li_)zj2l&6fekaq
 DEBUG = os.getenv("DJANGO_DEBUG", "false").lower() == "true"
 
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
-HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 
 # Local dev: your ngrok URL. Production (Railway): set BASE_URL to the
 # deployed https URL, e.g. https://your-app.up.railway.app

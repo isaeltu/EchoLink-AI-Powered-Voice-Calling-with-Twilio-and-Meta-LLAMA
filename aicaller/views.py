@@ -28,7 +28,13 @@ speaker_timeout = 5
 # instead of a fixed multi-second silence wait, which is what made the
 # original Gather feel slow to respond.
 speech_timeout = "auto"
-speech_language = "es-MX"
+speech_language = "es-MX"  # recognition language for the customer's speech (Gather input)
+# Plain <Say> with no voice defaults to Twilio's old robotic voice. Polly's
+# neural voices sound like an actual person -- this is the output voice, a
+# separate concern from speech_language above (which is about recognizing
+# what the *customer* says, not how the agent sounds).
+tts_voice = "Polly.Lupe-Neural"
+tts_language = "es-US"
 
 twilio_account_sid = settings.TWILIO_ACCOUNT_SID
 twilio_auth_token = settings.TWILIO_AUTH_TOKEN
@@ -44,7 +50,7 @@ CONFIRMATION_WORDS = (
     "si", "sí", "confirmo", "correcto", "correcta", "asi es", "así es",
     "exacto", "afirmativo", "dale", "vale", "esta bien", "está bien", "ok",
 )
-CONFIRMATION_PROMPT_WORDS = ("confirm", "correcto", "esta bien", "está bien")
+CONFIRMATION_PROMPT_WORDS = ("confirm",)
 
 
 def customer_confirmed(speech: str) -> bool:
@@ -267,9 +273,9 @@ class InboundCalls(View):
                 input='speech', action=f'{settings.BASE_URL}/inbounds/',
                 timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
             )
-            gather.say(greeting, language=speech_language)
+            gather.say(greeting, voice=tts_voice, language=tts_language)
             response.append(gather)
-            response.say(self.fallback_message, language=speech_language)
+            response.say(self.fallback_message, voice=tts_voice, language=tts_language)
             return HttpResponse(str(response), content_type='text/xml')
 
         should_extract_order = customer_confirmed(speech) and last_assistant_asked_to_confirm(call)
@@ -283,7 +289,7 @@ class InboundCalls(View):
                 VoiceMessage.objects.create(
                     voice_chat=call, role="assistant", content=self.closing_message, call_id=CallSid
                 )
-                response.say(self.closing_message, language=speech_language)
+                response.say(self.closing_message, voice=tts_voice, language=tts_language)
                 response.hangup()
                 return HttpResponse(str(response), content_type='text/xml')
             print(f"Order confirmation detected for call {CallSid} but extraction failed; continuing conversation.")
@@ -295,9 +301,9 @@ class InboundCalls(View):
             input='speech', action=f'{settings.BASE_URL}/inbounds/',
             timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
         )
-        gather.say(speakable_reply, language=speech_language)
+        gather.say(speakable_reply, voice=tts_voice, language=tts_language)
         response.append(gather)
-        response.say(self.fallback_message, language=speech_language)
+        response.say(self.fallback_message, voice=tts_voice, language=tts_language)
         return HttpResponse(str(response), content_type='text/xml')
 
 
@@ -346,9 +352,9 @@ class OutboundsCalls(View):
                 input='speech', action=f'{settings.BASE_URL}/outbounds/{id}',
                 timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
             )
-            gather.say(greeting, language=speech_language)
+            gather.say(greeting, voice=tts_voice, language=tts_language)
             response.append(gather)
-            response.say(self.fallback_message, language=speech_language)
+            response.say(self.fallback_message, voice=tts_voice, language=tts_language)
             return HttpResponse(str(response), content_type='text/xml')
 
         should_extract_order = customer_confirmed(speech) and last_assistant_asked_to_confirm(call)
@@ -362,7 +368,7 @@ class OutboundsCalls(View):
                 VoiceMessage.objects.create(
                     voice_chat=call, role="assistant", content=self.closing_message, call_id=CallSid
                 )
-                response.say(self.closing_message, language=speech_language)
+                response.say(self.closing_message, voice=tts_voice, language=tts_language)
                 response.hangup()
                 return HttpResponse(str(response), content_type='text/xml')
             print(f"Order confirmation detected for call {CallSid} but extraction failed; continuing conversation.")
@@ -374,7 +380,7 @@ class OutboundsCalls(View):
             input='speech', action=f'{settings.BASE_URL}/outbounds/{id}',
             timeout=speaker_timeout, speech_timeout=speech_timeout, language=speech_language,
         )
-        gather.say(speakable_reply, language=speech_language)
+        gather.say(speakable_reply, voice=tts_voice, language=tts_language)
         response.append(gather)
-        response.say(self.fallback_message, language=speech_language)
+        response.say(self.fallback_message, voice=tts_voice, language=tts_language)
         return HttpResponse(str(response), content_type='text/xml')
